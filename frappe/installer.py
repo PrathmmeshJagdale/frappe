@@ -395,7 +395,9 @@ def remove_app(app_name, dry_run=False, yes=False, no_backup=False, force=False)
 	for app in frappe.get_installed_apps():
 		if app != app_name:
 			hooks = frappe.get_hooks(app_name=app)
-			if hooks.required_apps and any(app_name in required_app for required_app in hooks.required_apps):
+			if hooks.required_apps and any(
+				app_name == required_app.split("/")[-1].strip() for required_app in hooks.required_apps
+			):
 				click.secho(f"App {app_name} is a dependency of {app}. Uninstall {app} first.", fg="yellow")
 				return
 
