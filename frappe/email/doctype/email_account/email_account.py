@@ -213,7 +213,9 @@ class EmailAccount(Document):
 
 		if self.notify_if_unreplied:
 			if not self.send_notification_to:
-				frappe.throw(_("{0} is mandatory").format(self.meta.get_label("send_notification_to")))
+				frappe.throw(
+					_("{0} is mandatory").format(self.meta.get_translated_label("send_notification_to"))
+				)
 			for e in self.get_unreplied_notification_emails():
 				validate_email_address(e, True)
 
@@ -1059,6 +1061,7 @@ def get_max_email_uid(email_account):
 			"communication_medium": "Email",
 			"sent_or_received": "Received",
 			"email_account": email_account,
+			"uid": (">", 0),
 		},
 		fields=[{"MAX": "uid", "as": "uid"}],
 	):

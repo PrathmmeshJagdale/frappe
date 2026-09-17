@@ -4,6 +4,7 @@
 """build query for doclistview and return results"""
 
 import json
+import re
 from functools import lru_cache
 from typing import Any
 
@@ -13,6 +14,7 @@ import frappe
 import frappe.permissions
 from frappe import _
 from frappe.core.doctype.access_log.access_log import make_access_log
+from frappe.desk.link_title import get_report_link_titles, send_link_titles
 from frappe.model import child_table_fields, default_fields, get_permitted_fields, optional_fields
 from frappe.model.base_document import get_controller
 from frappe.model.qb_query import DatabaseQuery
@@ -23,18 +25,29 @@ from frappe.utils.data import sbool
 DISALLOWED_PARAMS = ("cmd", "data", "ignore_permissions", "view", "user", "csrf_token", "join")
 SUPPORTED_AGGREGATE_FUNCTIONS = ("count", "sum", "avg")
 DEFAULT_AGGREGATE_FIELDNAME = "_aggregate_column"
+_FIELDNAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
 
 
 @frappe.whitelist()
 @frappe.read_only()
 def get():
 	args = get_form_params()
+	with_link_titles = sbool(args.pop("with_link_titles", False))
+
 	# If virtual doctype, get data from controller get_list method
 	if is_virtual_doctype(args.doctype):
 		controller = get_controller(args.doctype)
 		data = compress(frappe.call(controller.get_list, args=args, **args))
 	else:
 		data = compress(execute(**args), args=args)
+
+	# `compress` returns the rows untouched when there are none, and reduces a child table
+	# field to its bare fieldname, so pair the requested fields back up with its key order.
+	if with_link_titles and isinstance(data, dict):
+		field_info = {info.get("fieldname"): info for info in get_field_info(args.fields, args.doctype)}
+		columns = [field_info.get(key) for key in data["keys"]]
+		send_link_titles(get_report_link_titles(columns, data["values"]))
+
 	return data
 
 
@@ -210,6 +223,39 @@ def raise_invalid_field(fieldname):
 	frappe.throw(_("Field not permitted in query") + f": {fieldname}", frappe.DataError)
 
 
+def _validate_group_by_field(raw: str, doctype: str):
+	"""Validate a single `tabDoctype`.`fieldname` expression from saved report JSON."""
+	if not isinstance(raw, str) or not raw:
+		raise_invalid_field(raw)
+	try:
+		field_doctype, fieldname = parse_field(raw)
+	except ValueError:
+		raise_invalid_field(raw)
+	field_doctype = field_doctype or doctype
+	if not _FIELDNAME_RE.match(fieldname):
+		raise_invalid_field(raw)
+	try:
+		has_col = frappe.db.has_column(field_doctype, fieldname)
+	except frappe.db.TableMissingError:
+		raise_invalid_field(raw)
+	if not has_col:
+		raise_invalid_field(raw)
+
+
+def _validate_group_by_args(group_by: dict, doctype: str):
+	raw_func = group_by.get("aggregate_function")
+	if not isinstance(raw_func, str):
+		frappe.throw(_("Invalid aggregate function: {0}").format(raw_func), frappe.DataError)
+	func = raw_func.lower()
+	if func not in SUPPORTED_AGGREGATE_FUNCTIONS:
+		frappe.throw(_("Invalid aggregate function: {0}").format(func), frappe.DataError)
+
+	_validate_group_by_field(group_by.get("group_by", ""), doctype)
+
+	if func != "count":
+		_validate_group_by_field(group_by.get("aggregate_on", ""), doctype)
+
+
 def is_standard(fieldname):
 	if "." in fieldname:
 		fieldname = fieldname.split(".")[1].strip("`")
@@ -350,6 +396,10 @@ def save_report(name: str | int, doctype: str, report_settings: str):
 		report.report_name = name
 		report.ref_doctype = doctype
 
+	settings = json.loads(report_settings)
+	if isinstance(settings, dict) and isinstance(group_by := settings.get("group_by"), dict):
+		_validate_group_by_args(group_by, report.ref_doctype)
+
 	report.report_type = "Report Builder"
 	report.json = report_settings
 	report.save(ignore_permissions=True)
@@ -440,8 +490,25 @@ def _export_query(form_params, csv_params, populate_response=True):
 	add_totals_row = cint(form_params.pop("add_totals_row", 0))
 	translate_values = cint(form_params.pop("translate_values", 0))
 
+	visible_names = form_params.pop("visible_names", None)
+	if isinstance(visible_names, str):
+		visible_names = frappe.parse_json(visible_names)
+	if not (isinstance(visible_names, list) and visible_names):
+		visible_names = None
+
 	if selection := form_params.pop("selected_items", None):
 		form_params["filters"] = {"name": ("in", frappe.parse_json(selection))}
+
+	# visible_names is the client's ordered display sequence
+	# When present, take precedence over generic filters/order/pagination: fetch
+	# exactly those rows, then reorder in Python below.
+	# Mirrors the visible_idx pattern in Query Report.
+	if visible_names:
+		form_params["filters"] = {"name": ("in", visible_names)}
+		form_params["order_by"] = None
+		form_params.pop("page_length", None)
+		form_params.pop("limit_page_length", None)
+		form_params.pop("start", None)
 
 	make_access_log(
 		doctype=doctype,
@@ -452,6 +519,9 @@ def _export_query(form_params, csv_params, populate_response=True):
 
 	db_query = DatabaseQuery(doctype)
 	ret = db_query.execute(**form_params)
+
+	if visible_names:
+		ret = _reorder_by_visible_names(ret, form_params.get("fields", []), doctype, visible_names)
 
 	if not frappe.permissions.can_export(doctype):
 		if frappe.permissions.can_export(doctype, is_owner=True):
@@ -517,6 +587,29 @@ def _export_query(form_params, csv_params, populate_response=True):
 	provide_binary_file(_(title), file_extension, content)
 
 
+def _reorder_by_visible_names(ret, fields, doctype, visible_names):
+	"""Reorder `ret` (list of row tuples, `as_list=True`) so that rows appear
+	in the same order as `visible_names`. Rows whose primary key isn't in
+	`visible_names` are dropped. If the primary key column can't be located in
+	`fields`, `ret` is returned unchanged (server-order fallback).
+
+	Only the primary doctype's `name` column is a valid match.
+	Using linked doctype's `name` as the reorder key
+	would silently rebuild the export against the wrong identifier."""
+	name_field = f"`tab{doctype}`.`name`"
+	name_idx = None
+	for i, field in enumerate(fields):
+		if not isinstance(field, str):
+			continue
+		if field == name_field or field == "name":
+			name_idx = i
+			break
+	if name_idx is None:
+		return ret
+	ret_by_name = {row[name_idx]: row for row in ret}
+	return [ret_by_name[n] for n in visible_names if n in ret_by_name]
+
+
 def append_totals_row(data):
 	if not data:
 		return data
@@ -572,12 +665,14 @@ def get_field_info(fields, parent_doctype):
 			translatable = True
 		else:
 			meta = frappe.get_meta(doctype)
-			meta_df = meta.get_field(fieldname)
-			df = meta_df or get_default_df(fieldname)
+			df = meta.get_field(fieldname) or get_default_df(fieldname)
 
 			if df:
 				fieldname = df.fieldname
-				label = _(df.label or "") if meta_df else meta.get_label(fieldname)
+				label = meta.get_label(fieldname) or ""
+				if label:
+					label = _(label, context=doctype)
+
 				fieldtype = df.fieldtype
 				translatable = df.translatable or False
 				options = df.options
@@ -729,6 +824,10 @@ AGGREGATE_FIELD_INFO_HANDLERS = {
 	"AVG": _aggregate_avg_column_info,
 }
 
+assert set(AGGREGATE_FIELD_INFO_HANDLERS) == {fn.upper() for fn in SUPPORTED_AGGREGATE_FUNCTIONS}, (
+	"aggregate field info handlers must stay in sync with SUPPORTED_AGGREGATE_FUNCTIONS"
+)
+
 
 def get_aggregate_field_info(field: str | dict, parent_doctype: str) -> dict:
 	"""
@@ -783,11 +882,13 @@ def delete_items():
 
 	if len(items) > 10:
 		frappe.enqueue("frappe.desk.reportview.delete_bulk", doctype=doctype, items=items)
-	else:
-		delete_bulk(doctype, items)
+		return None
+
+	return delete_bulk(doctype, items)
 
 
 def delete_bulk(doctype, items):
+	"""Delete documents one by one. Returns names that could not be deleted."""
 	undeleted_items = []
 	for i, d in enumerate(items):
 		try:
@@ -812,19 +913,21 @@ def delete_bulk(doctype, items):
 			frappe.db.rollback()
 	if undeleted_items and len(items) != len(undeleted_items):
 		frappe.clear_messages()
-		delete_bulk(doctype, undeleted_items)
+		return delete_bulk(doctype, undeleted_items)
 	elif undeleted_items:
 		frappe.msgprint(
 			_("Failed to delete {0} documents: {1}").format(len(undeleted_items), ", ".join(undeleted_items)),
 			realtime=True,
 			title=_("Bulk Operation Failed"),
 		)
-	else:
-		frappe.msgprint(
-			_(f"Deleted {len(items)} records from {doctype} doctype"),
-			realtime=True,
-			title=_("Bulk Operation Successful"),
-		)
+		return undeleted_items
+
+	frappe.msgprint(
+		_("Deleted {0} records from {1} doctype").format(len(items), doctype),
+		realtime=True,
+		title=_("Bulk Operation Successful"),
+	)
+	return []
 
 
 @frappe.whitelist()

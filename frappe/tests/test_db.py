@@ -5,16 +5,17 @@ import datetime
 from math import ceil
 from random import choice
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import frappe
 from frappe.core.utils import find
 from frappe.custom.doctype.custom_field.custom_field import create_custom_field
-from frappe.database import savepoint
+from frappe.database import get_db, savepoint
 from frappe.database.database import get_query_execution_timeout
-from frappe.database.utils import FallBackDateTimeStr
+from frappe.database.utils import FallBackDateTimeStr, convert_backtick_identifiers
 from frappe.query_builder import Field
 from frappe.query_builder.functions import Concat_ws
-from frappe.tests import IntegrationTestCase, timeout
+from frappe.tests import IntegrationTestCase, UnitTestCase, timeout
 from frappe.tests.test_query_builder import db_type_is, run_only_if, unimplemented_for
 from frappe.utils import add_days, now, random_string, set_request
 from frappe.utils.data import now_datetime
@@ -259,10 +260,14 @@ class TestDB(IntegrationTestCase):
 
 		frappe.flags.touched_tables = set()
 		cf = create_custom_field("ToDo", {"label": "ToDo Custom Field"})
+		# deleting the Custom Field leaves its column on the table, so without dropping it the next
+		# run adds no column, logs no ALTER TABLE, and never sees tabToDo as touched
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(frappe.db.sql_ddl, "ALTER TABLE `tabToDo` DROP COLUMN IF EXISTS `todo_custom_field`")
+		if cf:
+			self.addCleanup(cf.delete)
 		self.assertIn("tabToDo", frappe.flags.touched_tables)
 		self.assertIn("tabCustom Field", frappe.flags.touched_tables)
-		if cf:
-			cf.delete()
 		frappe.db.commit()
 		frappe.flags.in_migrate = False
 		frappe.flags.touched_tables.clear()
@@ -564,6 +569,11 @@ class TestDB(IntegrationTestCase):
 	def test_estimated_count(self):
 		self.assertGreater(frappe.db.estimate_count("DocField"), 100)
 
+	@run_only_if(db_type_is.POSTGRES)
+	def test_estimated_count_clamps_unanalyzed_table(self):
+		with patch.object(frappe.db, "sql", return_value=((-1.0,),)):
+			self.assertEqual(frappe.db._estimate_count("tabUser"), 0)
+
 	def test_datetime_serialization(self):
 		dt = now_datetime()
 		dt = dt.replace(microsecond=0)
@@ -700,6 +710,11 @@ class TestDB(IntegrationTestCase):
 		self.assertIsInstance(note_docs, tuple)
 
 	@run_only_if(db_type_is.POSTGRES)
+	def test_column_metadata_queries_bind_table_name(self):
+		self.assertFalse(frappe.db.get_table_columns_description("tabUser' OR TRUE --"))
+		self.assertFalse(frappe.db.describe("User' OR TRUE --"))
+
+	@run_only_if(db_type_is.POSTGRES)
 	def test_modify_query(self):
 		from frappe.database.postgres.database import modify_query
 
@@ -716,6 +731,44 @@ class TestDB(IntegrationTestCase):
 		)
 
 	@run_only_if(db_type_is.POSTGRES)
+	def test_modify_query_rewrites_regexp_operator_only(self):
+		from frappe.database.postgres.database import modify_query
+
+		self.assertEqual("select 'a' ~* 'b'", modify_query("select 'a' REGEXP 'b'"))
+		self.assertEqual("select 'a' !~* 'b'", modify_query("select 'a' NOT REGEXP 'b'"))
+
+		# the operator only exists outside quoted tokens and comments
+		self.assertEqual("select 'A REGEXP B'", modify_query("select 'A REGEXP B'"))
+		self.assertEqual("select 1 -- a REGEXP here", modify_query("select 1 -- a REGEXP here"))
+		self.assertEqual("select 1 /* a REGEXP here */", modify_query("select 1 /* a REGEXP here */"))
+		self.assertEqual("select $$a REGEXP b$$", modify_query("select $$a REGEXP b$$"))
+		self.assertEqual("select $t$a REGEXP b$t$", modify_query("select $t$a REGEXP b$t$"))
+		# backticks become double quotes before this runs, so a doctype whose name contains the
+		# word must keep its table name intact
+		self.assertEqual(
+			'select 1 from "tabMy Regexp Rules"', modify_query("select 1 from `tabMy Regexp Rules`")
+		)
+		self.assertEqual('select "col REGEXP name"', modify_query('select "col REGEXP name"'))
+		self.assertEqual(r"select E'a\' REGEXP b'", modify_query(r"select E'a\' REGEXP b'"))
+		# an escape string must not desynchronise the scan: a real operator after one still converts
+		self.assertEqual(
+			r"select E'x\' REGEXP y' , 'z' ~* 'w'",
+			modify_query(r"select E'x\' REGEXP y' , 'z' REGEXP 'w'"),
+		)
+		# ... while a standard literal ends at its closing quote even with a trailing backslash
+		self.assertEqual(r"select 'a\' as c, 'b' ~* 'c'", modify_query(r"select 'a\' as c, 'b' REGEXP 'c'"))
+
+		# and the rewritten operators are valid SQL
+		self.assertEqual(frappe.db.sql("select 'abc' REGEXP 'B'")[0][0], True)
+		self.assertEqual(frappe.db.sql("select 'abc' NOT REGEXP 'z'")[0][0], True)
+		self.assertEqual(frappe.db.sql("select 'A REGEXP B'")[0][0], "A REGEXP B")
+
+	def test_regex_filter_operator(self):
+		# pypika's Term.regex renders " REGEX ", which is not an operator on either backend
+		matched = frappe.get_all("User", filters={"name": ["regex", "^Administrator$"]}, pluck="name")
+		self.assertEqual(matched, ["Administrator"])
+
+	@run_only_if(db_type_is.POSTGRES)
 	def test_modify_values(self):
 		from frappe.database.postgres.database import modify_values
 
@@ -723,6 +776,8 @@ class TestDB(IntegrationTestCase):
 			{"a": "23", "b": 23.0, "c": 23.0345, "d": "wow", "e": ("1", "2", "3", "abc")},
 			modify_values({"a": 23, "b": 23.0, "c": 23.0345, "d": "wow", "e": [1, 2, 3, "abc"]}),
 		)
+		# bool is a subclass of int, it must not end up as "True"
+		self.assertEqual({"a": "1", "b": "0"}, modify_values({"a": True, "b": False}))
 		self.assertEqual(
 			["23", 23.0, 23.00004345, "wow", ("1", "2", "3", "abc")],
 			modify_values((23, 23.0, 23.00004345, "wow", [1, 2, 3, "abc"])),
@@ -759,8 +814,88 @@ class TestDB(IntegrationTestCase):
 
 		self.assertEqual(order_of_execution, list(range(0, 9)))
 
+	def test_failing_after_commit_callback(self):
+		executed = []
+
+		def fail():
+			raise ValueError("Outgoing mail server is unreachable")
+
+		frappe.db.after_commit.add(fail)
+		frappe.db.after_commit.add(lambda: executed.append("cache cleared"))
+
+		with patch("frappe.log_error") as log_error:
+			frappe.db.commit()
+
+		self.assertEqual(executed, ["cache cleared"])
+		log_error.assert_called_once()
+		self.assertEqual(len(frappe.db.after_commit), 0)
+
+	def test_failing_after_rollback_callback(self):
+		executed = []
+
+		def fail():
+			raise OSError("File on disk is gone")
+
+		frappe.db.after_rollback.add(fail)
+		frappe.db.after_rollback.add(lambda: executed.append("cache cleared"))
+
+		with patch("frappe.log_error") as log_error:
+			frappe.db.rollback()
+
+		self.assertEqual(executed, ["cache cleared"])
+		log_error.assert_called_once()
+		self.assertEqual(len(frappe.db.after_rollback), 0)
+
 	def test_db_explain(self):
 		frappe.db.sql("select 1", debug=1, explain=1)
+
+	@unimplemented_for(db_type_is.SQLITE)
+	def test_session_time_zone_follows_system_timezone(self):
+		with patch("frappe.database.database.get_system_timezone", return_value="America/New_York"):
+			db = get_db(
+				socket=frappe.db.socket,
+				host=frappe.db.host,
+				user=frappe.db.user,
+				password=frappe.db.password,
+				port=frappe.db.port,
+				cur_db_name=frappe.db.cur_db_name,
+			)
+			try:
+				db_now = db.sql("select LOCALTIMESTAMP")[0][0]
+			finally:
+				db.close()
+
+		expected = datetime.datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+		self.assertLess(abs((expected - db_now).total_seconds()), 10)
+
+	@run_only_if(db_type_is.MARIADB)
+	def test_session_time_zone_falls_back_to_utc_offset(self):
+		from frappe.database.mariadb.database import MariaDBDatabase
+		from frappe.database.mariadb.mysqlclient import MariaDBDatabase as MySQLClientDatabase
+
+		for db_class in (MariaDBDatabase, MySQLClientDatabase):
+			with patch.object(db_class, "sql", side_effect=[db_class.OperationalError, None]) as mocked_sql:
+				db_class(cur_db_name=frappe.db.cur_db_name).set_session_time_zone("Asia/Kolkata")
+
+			mocked_sql.assert_called_with("set session time_zone = %s", "+05:30")
+
+	@unimplemented_for(db_type_is.SQLITE)
+	def test_connect_survives_session_time_zone_failure(self):
+		with patch(
+			"frappe.database.database.get_system_timezone", side_effect=Exception("timezone unavailable")
+		):
+			db = get_db(
+				socket=frappe.db.socket,
+				host=frappe.db.host,
+				user=frappe.db.user,
+				password=frappe.db.password,
+				port=frappe.db.port,
+				cur_db_name=frappe.db.cur_db_name,
+			)
+			try:
+				self.assertEqual(db.sql("select 1")[0][0], 1)
+			finally:
+				db.close()
 
 
 @run_only_if(db_type_is.MARIADB)
@@ -956,6 +1091,14 @@ class TestDBSetValue(IntegrationTestCase):
 		if frappe.conf.db_type == "mariadb":
 			self.assertTrue("UPDATE `tabToDo` SET" in query)
 
+	def test_bool_value_for_check_field(self):
+		# postgres does not accept `true` in a smallint (Check) column
+		frappe.db.set_value("User", "Administrator", "mute_sounds", True)
+		self.assertEqual(frappe.db.get_value("User", "Administrator", "mute_sounds"), 1)
+
+		frappe.db.set_value("User", "Administrator", "mute_sounds", False)
+		self.assertEqual(frappe.db.get_value("User", "Administrator", "mute_sounds"), 0)
+
 	def test_cleared_cache(self):
 		self.todo2.reload()
 		frappe.get_cached_doc(self.todo2.doctype, self.todo2.name)  # init cache
@@ -976,6 +1119,10 @@ class TestDDLCommandsPost(IntegrationTestCase):
 	test_table_name = "TestNotes"
 
 	def setUp(self) -> None:
+		# several tests here call APIs that commit (add_index, advisory_lock, ...), so this table
+		# outlives a rollback. Drop first, and unconditionally in tearDown, or one failing test
+		# leaves it behind and every later run dies in setUp with "relation already exists".
+		self._drop_test_tables()
 		frappe.db.sql(
 			f"""
 			CREATE TABLE "tab{self.test_table_name}" ("id" INT NULL, content text, PRIMARY KEY ("id"))
@@ -983,8 +1130,12 @@ class TestDDLCommandsPost(IntegrationTestCase):
 		)
 
 	def tearDown(self) -> None:
-		frappe.db.sql(f'DROP TABLE "tab{self.test_table_name}"')
 		self.test_table_name = "TestNotes"
+		self._drop_test_tables()
+
+	def _drop_test_tables(self) -> None:
+		for table in ("tabTestNotes", "tabTestNotes_new"):
+			frappe.db.sql_ddl(f'DROP TABLE IF EXISTS "{table}" CASCADE')
 
 	def test_rename(self) -> None:
 		new_table_name = f"{self.test_table_name}_new"
@@ -1099,6 +1250,90 @@ class TestDDLCommandsPost(IntegrationTestCase):
 		self.assertIn("INCLUDE", indexdef)
 		self.assertIn("content", indexdef)
 
+	def test_bulk_insert_matches_insert_for_time_values(self) -> None:
+		import datetime
+
+		from frappe.core.doctype.doctype.test_doctype import new_doctype
+
+		doctype = new_doctype(fields=[{"fieldname": "shift", "fieldtype": "Time"}]).insert()
+		table = f"tab{doctype.name}"
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(frappe.db.sql_ddl, f'DROP TABLE IF EXISTS "{table}" CASCADE')
+		self.addCleanup(doctype.delete)
+
+		# a Time field is a timedelta and MariaDB's TIME accepts well past 24h, so migrated data
+		# can carry one. COPY must not reject what the row-by-row INSERT path accepts.
+		for value in (
+			datetime.timedelta(hours=13, minutes=3, seconds=4),
+			datetime.timedelta(hours=25, minutes=3, seconds=4),
+			datetime.timedelta(hours=49),
+		):
+			frappe.db.sql(f'DELETE FROM "{table}"')
+			frappe.db.bulk_insert(doctype.name, ["name", "shift"], [["copied", value]])
+			frappe.db.sql(f'INSERT INTO "{table}" (name, shift) VALUES (%s, %s)', ("inserted", value))
+			rows = dict(frappe.db.sql(f'SELECT name, shift FROM "{table}"'))
+			self.assertEqual(rows["copied"], rows["inserted"], msg=f"COPY differs from INSERT for {value}")
+
+	def test_default_index_names_separate_plain_partial_and_covering(self) -> None:
+		frappe.db.add_index(self.test_table_name, ["id"])
+		frappe.db.add_index(self.test_table_name, ["id"], where="id > 0")
+		frappe.db.add_index(self.test_table_name, ["id"], where="id > 100")
+		frappe.db.add_index(self.test_table_name, ["id"], include=["content"])
+
+		defs = frappe.db.sql(
+			"""SELECT indexdef FROM pg_indexes
+			WHERE tablename = %s AND indexname LIKE %s""",
+			(f"tab{self.test_table_name}", f"tab{self.test_table_name}_id%_index"),
+			pluck=True,
+		)
+		self.assertEqual(len(defs), 4, msg=f"each definition needs its own index, got {defs}")
+		self.assertEqual(len([d for d in defs if "WHERE (id > 0)" in d]), 1)
+		self.assertEqual(len([d for d in defs if "WHERE (id > 100)" in d]), 1)
+		self.assertEqual(len([d for d in defs if "INCLUDE (content)" in d]), 1)
+
+	def test_default_index_name_is_stable_for_one_definition(self) -> None:
+		from frappe.database.postgres.schema import get_qualified_index_name
+
+		table = f"tab{self.test_table_name}"
+		# a comment is whitespace to SQL, so it does not change which index a predicate names
+		for formatted, plain in (
+			("id  >   0", "id > 0"),
+			("id > 0 /* why */ AND id < 9", "id > 0 AND id < 9"),
+			("id > 0 -- why\nAND id < 9", "id > 0 AND id < 9"),
+		):
+			self.assertEqual(
+				get_qualified_index_name(table, ["id"], where=formatted),
+				get_qualified_index_name(table, ["id"], where=plain),
+				msg=f"{formatted!r} and {plain!r} are the same predicate",
+			)
+
+		# ... but the newline ending a line comment decides what is code, so it stays significant
+		self.assertNotEqual(
+			get_qualified_index_name(table, ["id"], where="id > 0 -- why\nAND id < 9"),
+			get_qualified_index_name(table, ["id"], where="id > 0 -- why AND id < 9"),
+		)
+		# but whitespace inside a quoted token is part of the predicate, not formatting
+		for two_spaces, one_space in (
+			("content = 'a  b'", "content = 'a b'"),
+			('"a  b" > 0', '"a b" > 0'),
+			("content = $$a  b$$", "content = $$a b$$"),
+			("content = $t$a  b$t$", "content = $t$a b$t$"),
+			(r"content = E'a\'  b'", r"content = E'a\' b'"),
+		):
+			self.assertNotEqual(
+				get_qualified_index_name(table, ["id"], where=two_spaces),
+				get_qualified_index_name(table, ["id"], where=one_space),
+				msg=f"{two_spaces!r} and {one_space!r} must not share a name",
+			)
+		self.assertNotEqual(
+			get_qualified_index_name(table, ["id"]),
+			get_qualified_index_name(table, ["id"], where="id > 0"),
+		)
+		self.assertNotEqual(
+			get_qualified_index_name(table, ["id"], include=["content"]),
+			get_qualified_index_name(table, ["id"]),
+		)
+
 	def test_add_index_rejects_unknown_method(self) -> None:
 		# `using` reaches the DDL string verbatim, so an unknown method must be refused, not run.
 		with self.assertRaises(frappe.ValidationError):
@@ -1192,7 +1427,15 @@ class TestDDLCommandsPost(IntegrationTestCase):
 	def test_sequence_table_creation(self):
 		from frappe.core.doctype.doctype.test_doctype import new_doctype
 
+		# fixed name: an earlier failed run would otherwise make every later one fail on insert
+		if frappe.db.exists("DocType", "autoinc_dt_seq_test"):
+			frappe.delete_doc("DocType", "autoinc_dt_seq_test", force=True, ignore_permissions=True)
+
 		dt = new_doctype("autoinc_dt_seq_test", autoname="autoincrement").insert(ignore_permissions=True)
+		self.addCleanup(
+			lambda: frappe.db.exists("DocType", "autoinc_dt_seq_test")
+			and frappe.delete_doc("DocType", "autoinc_dt_seq_test", force=True, ignore_permissions=True)
+		)
 
 		if frappe.db.db_type == "postgres":
 			self.assertTrue(
@@ -1821,3 +2064,81 @@ class TestBulkInsertCopy(IntegrationTestCase):
 		got = dict(frappe.db.sql('SELECT "name", "flag" FROM "tabBulkFlagTest"'))
 		self.assertEqual(got["a"], 1)
 		self.assertEqual(got["b"], 0)
+
+
+class TestBacktickIdentifierConversion(UnitTestCase):
+	"""The postgres and sqlite drivers translate MySQL-style raw SQL into ANSI quoting.
+
+	Only backticks that delimit an identifier may be rewritten: one inside a string literal or a
+	``"..."`` identifier is content, and promoting it into a quote char ends the identifier early.
+	"""
+
+	def test_identifiers_are_translated(self):
+		for src, want in (
+			("select `name` from `tabUser`", 'select "name" from "tabUser"'),
+			("select `tabA`.`b` from `tabA`", 'select "tabA"."b" from "tabA"'),
+			("select `Note Seen By`.`user`", 'select "Note Seen By"."user"'),
+			("select `na``me` from t", 'select "na`me" from t'),
+			('select `na"me` from t', 'select "na""me" from t'),
+		):
+			with self.subTest(src=src):
+				self.assertEqual(want, convert_backtick_identifiers(src))
+
+	def test_query_without_backticks_is_untouched(self):
+		self.assertEqual("select 1", convert_backtick_identifiers("select 1"))
+
+	def test_string_literals_are_not_rewritten(self):
+		for src in (
+			"select * from t where c = 'a`b'",
+			"select * from t where c = 'it''s `x`'",
+			"select * from t where c = 'SELECT `x` FROM `y`'",
+		):
+			with self.subTest(src=src):
+				self.assertEqual(src, convert_backtick_identifiers(src))
+
+	def test_existing_ansi_identifiers_are_not_rewritten(self):
+		for src in (
+			'select "na`me" from t',
+			'select "a""b" from t',
+			'select "name` FROM `tabUser` -- " from "tabUser"',
+		):
+			with self.subTest(src=src):
+				self.assertEqual(src, convert_backtick_identifiers(src))
+
+	def test_comments_are_not_rewritten(self):
+		# a comment is data on both backends, so the shared pattern already steps over one
+		for src, want in (
+			("select `a` -- `b`", 'select "a" -- `b`'),
+			("select /* `b` */ `a`", 'select /* `b` */ "a"'),
+		):
+			with self.subTest(src=src):
+				self.assertEqual(want, convert_backtick_identifiers(src))
+
+	def test_apostrophe_in_a_comment_does_not_swallow_identifiers(self):
+		# An apostrophe inside a comment is not a string delimiter, so it must not pair with the
+		# next quote: everything between them -- real identifiers included -- would then read as
+		# one literal and go out untranslated.
+		for src in (
+			"/* it's */ select `tabUser`.`name` from `tabUser` where c = 'a'",
+			"-- it's\nselect `tabUser`.`name` from `tabUser` where c = 'a'",
+		):
+			with self.subTest(src=src):
+				out = convert_backtick_identifiers(src)
+				self.assertIn('"tabUser"."name"', out)
+				self.assertNotIn("`", out)
+
+	def test_injected_column_name_stays_one_identifier(self):
+		# as pypika renders `table[payload]` when the quote char is "
+		for payload in (
+			"name` FROM `tabUser` WHERE `name`='Administrator' -- ",
+			"name`=1 UNION SELECT `name` FROM `tabUser` -- ",
+			"` blah`",
+			'a`b"c',
+		):
+			with self.subTest(payload=payload):
+				rendered = '"{}"'.format(payload.replace('"', '""'))
+				out = convert_backtick_identifiers(f'SELECT {rendered} FROM "tabUser"')
+				body = out[len("SELECT ") : out.index(' FROM "tabUser"')]
+				self.assertTrue(body.startswith('"') and body.endswith('"'), body)
+				for run in body[1:-1].split('""'):  # every quote char must be in an escaped pair
+					self.assertNotIn('"', run, f"identifier closed early: {body}")

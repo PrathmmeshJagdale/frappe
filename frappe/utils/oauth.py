@@ -1,9 +1,9 @@
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 
-import base64
 import json
 from collections.abc import Callable
+from functools import lru_cache
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -19,6 +19,61 @@ if TYPE_CHECKING:
 
 
 class SignupDisabledError(frappe.PermissionError): ...
+
+
+# Microsoft signs Office 365 id_tokens (both v1.0 and v2.0) with keys published here,
+# regardless of which tenant issued the token.
+OFFICE_365_JWKS_URI = "https://login.microsoftonline.com/common/discovery/keys"
+
+
+@lru_cache(maxsize=1)
+def _get_office_365_jwks_client():
+	from jwt import PyJWKClient
+
+	return PyJWKClient(OFFICE_365_JWKS_URI, cache_keys=True)
+
+
+def get_verified_office_365_claims(token: str, client_id: str) -> dict:
+	"""Decode an Office 365 id_token, verifying its Microsoft-issued signature and audience.
+
+	Unlike a same-tenant assumption, this does NOT verify that the token came from any
+	particular organization's Entra tenant, since the token could legitimately come from any
+	tenant (the /common endpoint is inherently multi-tenant). Tenant restriction is enforced
+	separately, by checking the returned "tid" claim against the Social Login Key's
+	configured Tenant ID.
+	"""
+	import jwt
+
+	signing_key = _get_office_365_jwks_client().get_signing_key_from_jwt(token)
+	return jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=client_id)
+
+
+def enforce_office_365_tenant(info: dict, provider: str) -> None:
+	"""Reject the login unless it comes from a tenant this Social Login Key trusts.
+
+	Office 365's default endpoint (/common) is multi-tenant: a validly-signed token can
+	legitimately come from any Entra tenant, not just this organization's. The token's
+	signature and audience don't distinguish one tenant from another, so the "tid" claim
+	is checked separately against the Social Login Key's configured Tenant ID.
+	"""
+	tenant_id, trust_any_tenant = frappe.db.get_value(
+		"Social Login Key", provider, ["tenant_id", "trust_any_tenant"]
+	)
+
+	if trust_any_tenant:
+		return
+
+	if not tenant_id:
+		frappe.throw(
+			_(
+				"This Office 365 Social Login Key is not restricted to a specific tenant. "
+				"Set a Tenant ID, or enable 'Trust Any Tenant' if you intend to allow sign-in "
+				"from any organization."
+			)
+		)
+
+	if info.get("tid") != tenant_id:
+		frappe.throw(_("This Microsoft account does not belong to the expected organization."))
 
 
 def build_oauth_url(base_url: str, url: str | None = None) -> str:
@@ -93,19 +148,40 @@ def get_oauth_keys(provider: str) -> dict[str, str]:
 	}
 
 
+OAUTH_LOGIN_FLOW_CACHE_PREFIX = "frappe_oauth_login"
+
+
+def create_oauth_state(redirect_to: str | None) -> str:
+	"""Create a single-use token referencing this login attempt's `redirect_to`.
+
+	The returned token is what gets sent to the OAuth provider as `state`.
+	"""
+	state = frappe.generate_hash(length=32)
+	frappe.cache.set_value(f"{OAUTH_LOGIN_FLOW_CACHE_PREFIX}:{state}", redirect_to or "", expires_in_sec=600)
+	return state
+
+
+def consume_oauth_state(state: str) -> str | None:
+	"""Look up and invalidate the redirect_to stored for this login attempt.
+
+	Returns None if `state` doesn't reference a known, unused login attempt.
+	"""
+	if not state:
+		return None
+	key = f"{OAUTH_LOGIN_FLOW_CACHE_PREFIX}:{state}"
+	redirect_to = frappe.cache.get_value(key)
+	frappe.cache.delete_value(key)
+	return redirect_to
+
+
 def get_oauth2_authorize_url(provider: str, redirect_to: str) -> str:
 	flow = get_oauth2_flow(provider)
 
-	state = {
-		"site": frappe.utils.get_url(),
-		"token": frappe.generate_hash(),
-		"redirect_to": redirect_to,
-	}
+	state = create_oauth_state(redirect_to)
 
-	# relative to absolute url
 	data = {
 		"redirect_uri": get_redirect_uri(provider),
-		"state": base64.b64encode(bytes(json.dumps(state).encode("utf-8"))),
+		"state": state,
 	}
 
 	oauth2_providers = get_oauth2_providers()
@@ -177,19 +253,55 @@ def get_info_via_oauth(provider: str, code: str, decoder: Callable | None = None
 	if id_token:
 		parsed_access = json.loads(session.access_token_response.text)
 		token = parsed_access["id_token"]
-		info = jwt.decode(token, flow.client_secret, options={"verify_signature": False})
+
+		if provider == "office_365":
+			client_id = get_oauth_keys(provider)["client_id"]
+			info = get_verified_office_365_claims(token, client_id)
+			enforce_office_365_tenant(info, provider)
+
+			if "email_verified" not in info:
+				# Azure AD's id_token doesn't emit this claim; having verified the signature
+				# and pinned the issuing tenant above, this organization's own directory data
+				# is trusted.
+				info["email_verified"] = True
+		else:
+			info = jwt.decode(token, flow.client_secret, options={"verify_signature": False})
 
 	else:
 		api_endpoint = oauth2_providers[provider].get("api_endpoint")
 		api_endpoint_args = oauth2_providers[provider].get("api_endpoint_args")
 		info = session.get(api_endpoint, params=api_endpoint_args).json()
 
-		if provider == "github" and not info.get("email"):
-			emails = session.get("/user/emails", params=api_endpoint_args).json()
-			email_dict = next(filter(lambda x: x.get("primary"), emails))
-			info["email"] = email_dict.get("email")
+		if provider == "github":
+			if info.get("email"):
+				# GitHub only allows a verified address to be set as the public profile email.
+				info["email_verified"] = True
+			else:
+				emails = session.get("/user/emails", params=api_endpoint_args).json()
+				email_dict = next(filter(lambda x: x.get("primary"), emails), None)
+				if email_dict:
+					info["email"] = email_dict.get("email")
+					info["email_verified"] = email_dict.get("verified", False)
 
-	if not (info.get("email_verified") or get_email(info)):
+		if provider == "google" and "verified_email" in info:
+			info["email_verified"] = info.get("verified_email")
+
+		if provider == "facebook" and info.get("email"):
+			# Facebook only returns "email" once the user has confirmed it, and the
+			# per-user "verified" field is deprecated/unreliable, so trust presence directly.
+			info["email_verified"] = True
+
+	provider_trusts_unverified_email = frappe.db.get_value(
+		"Social Login Key", provider, "trust_email_without_verified_claim"
+	)
+	if not (
+		get_email(info)
+		and (
+			info.get("email_verified")
+			# never override an explicit "email_verified": false, only its absence
+			or ("email_verified" not in info and provider_trusts_unverified_email)
+		)
+	):
 		frappe.throw(_("Email not verified with {0}").format(provider.title()))
 
 	return info
@@ -199,19 +311,19 @@ def login_oauth_user(
 	data: dict | str,
 	*,
 	provider: str | None = None,
-	state: dict | str,
+	state: str,
 	generate_login_token: bool = False,
 ):
-	# json.loads data and state
 	if isinstance(data, str):
 		data = json.loads(data)
 
-	if isinstance(state, str):
-		state = base64.b64decode(state)
-		state = json.loads(state.decode("utf-8"))
-
-	if not (state and state["token"]):
-		frappe.respond_as_web_page(_("Invalid Request"), _("Token is missing"), http_status_code=417)
+	redirect_to = consume_oauth_state(state)
+	if redirect_to is None:
+		frappe.respond_as_web_page(
+			_("Invalid Request"),
+			_("Your login attempt is invalid or has expired. Please try again."),
+			http_status_code=417,
+		)
 		return
 
 	# All user emails are stored as lowercase, but OAuth provider could have it in mixed case.
@@ -248,10 +360,9 @@ def login_oauth_user(
 		frappe.response["login_token"] = login_token
 
 	else:
-		redirect_to = state.get("redirect_to")
 		redirect_post_login(
 			desk_user=frappe.local.response.get("message") == "Logged In",
-			redirect_to=redirect_to,
+			redirect_to=redirect_to or None,
 			provider=provider,
 		)
 

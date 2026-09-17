@@ -727,7 +727,7 @@ export default class GridRow {
 
 		this.grid.visible_columns.forEach((col, ci) => {
 			// to get update df for the row
-			let df = fields.find((field) => field?.fieldname === col[0].fieldname);
+			let df = this.get_column_docfield(fields, col[0].fieldname);
 
 			this.set_dependant_property(df);
 
@@ -795,6 +795,18 @@ export default class GridRow {
 			this.doc &&
 			!column.df.hidden
 		);
+	}
+
+	get_column_docfield(fields, fieldname) {
+		const column_df = fields.find((field) => field?.fieldname === fieldname);
+		const row_df = this.docfields?.find((df) => df.fieldname === fieldname);
+
+		if (!column_df || !row_df || column_df === row_df) return column_df;
+
+		row_df.sticky = column_df.sticky;
+		row_df.in_list_view = column_df.in_list_view;
+
+		return row_df;
 	}
 
 	set_dependant_property(df) {
@@ -894,9 +906,18 @@ export default class GridRow {
 		}
 		let input_class = this._get_fieldtype_class(df.fieldtype);
 
+		let add_class = "";
+		let add_style = `flex: 1 0 ${width}px; width: ${width}px;`;
+		if (df.sticky) {
+			add_class = " sticky-grid-col";
+			add_style += `left: ${this.grid.get_sticky_offset(df.fieldname)}px;`;
+		}
+
 		let $col = $(
-			`<div class="col grid-static-col search" style="flex: 1 0 ${width}px; width: ${width}px;"></div>`
-		).appendTo(this.row);
+			`<div class="col grid-static-col search${add_class}" style="${add_style}"></div>`
+		)
+			.attr("data-fieldname", df.fieldname)
+			.appendTo(this.row);
 
 		let $search_input = $(`
 			<input
@@ -1027,9 +1048,12 @@ export default class GridRow {
 						$wrapper.append($dropdown);
 
 						let element_position = event.target.getBoundingClientRect();
+						// both rects are viewport relative; jQuery's offset() is document
+						// relative, and mixing the two shifts the dropdown by the page scroll
+						let grid_field_position = $grid_field[0].getBoundingClientRect();
 
-						let left_difference = element_position.left - $grid_field.offset().left;
-						let top_difference = element_position.top - $grid_field.offset().top + 30;
+						let left_difference = element_position.left - grid_field_position.left;
+						let top_difference = element_position.top - grid_field_position.top + 30;
 						$wrapper.css({
 							position: "absolute",
 							top: `${top_difference + 10}px`,
@@ -1408,16 +1432,14 @@ export default class GridRow {
 		let cannot_add_rows =
 			this.grid.cannot_add_rows || (this.grid.df && this.grid.df.cannot_add_rows);
 		this.wrapper
-			.find(
-				".grid-insert-row-below, .grid-insert-row, .grid-duplicate-row, .grid-append-row"
-			)
+			.find(".grid-insert-row-below, .grid-insert-row, .grid-duplicate-row")
 			.toggle(!cannot_add_rows);
 
 		this.wrapper
 			.find(".grid-delete-row")
 			.toggle(!(this.grid.df && this.grid.df.cannot_delete_rows));
 
-		frappe.dom.freeze("", "dark grid-form");
+		frappe.dom.freeze("", "grid-form");
 		if (cur_frm) cur_frm.cur_grid = this;
 		this.wrapper.addClass("grid-row-open");
 		if (
@@ -1525,9 +1547,7 @@ export default class GridRow {
 				? this.grid.user_defined_columns
 				: this.docfields;
 
-		let df = fields.find((col) => {
-			return col?.fieldname === fieldname;
-		});
+		let df = this.get_column_docfield(fields, fieldname);
 
 		// format values if no frm
 		if (df && this.doc) {

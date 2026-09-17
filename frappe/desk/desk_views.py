@@ -4,6 +4,7 @@
 from functools import cached_property
 
 import frappe
+from frappe.app_state import get_disabled_modules
 from frappe.permissions import has_permission
 from frappe.query_builder import DocType
 from frappe.query_builder.functions import Count
@@ -98,16 +99,45 @@ class DeskViews:
 	def get_allowed_dashboards(cls, cache=False):
 		"""Return dashboards the user is allowed to see.
 
-		A dashboard is permitted when the user can access at least one of its charts or cards.
+		A dashboard that holds charts or cards is permitted when the user can access at least
+		one of them. A dashboard that holds neither is permitted on the `Dashboard` document's
+		own permission, which `frappe.get_list` applies. An app draws such a dashboard with an
+		island, and draws its own not-permitted state below the document.
+
 		Evaluated for the current session user and cached like pages and reports.
 		"""
 		from frappe.desk.doctype.dashboard.dashboard import get_permitted_cards, get_permitted_charts
 
 		def build():
+			# `module` rides along so the client can resolve a dashboard's home sidebar; the row
+			# stays a dict in a list rather than becoming a name-keyed map, so search_utils'
+			# get_dashboards() is untouched.
+			try:
+				dashboards = frappe.get_list("Dashboard", fields=["name", "module"])
+			except frappe.PermissionError:
+				# a user with no read access to `Dashboard` simply has no dashboards. This runs
+				# during boot, so the error must not escape and take the desk down with it.
+				frappe.clear_last_message()
+				return []
+
+			if not dashboards:
+				return []
+
+			# One query per child table, so no dashboard is loaded to learn it is empty.
+			filled = set()
+			for child in ("Dashboard Chart Link", "Number Card Link"):
+				filled.update(
+					frappe.get_all(
+						child,
+						filters={"parenttype": "Dashboard", "parent": ("in", [d.name for d in dashboards])},
+						pluck="parent",
+					)
+				)
+
 			return [
-				{"name": name}
-				for name in frappe.get_all("Dashboard", pluck="name")
-				if get_permitted_charts(name) or get_permitted_cards(name)
+				{"name": d.name, "module": d.module}
+				for d in dashboards
+				if d.name not in filled or get_permitted_charts(d.name) or get_permitted_cards(d.name)
 			]
 
 		return cls._allowed_entity_cache("allowed_dashboards", frappe.session.user, build, cache=cache)
@@ -121,7 +151,7 @@ class DeskViews:
 		"""
 		if cache:
 			cached = frappe.cache.get_value(key, user=user)
-			if cached:
+			if cached is not None:
 				return cached
 
 		value = builder()
@@ -150,17 +180,22 @@ class DeskViews:
 
 		is_report = parent == "Report"
 
+		# `module` is selected for both so the client can resolve a Page's or Report's home sidebar
+		# from boot data alone. Only a DocType's module comes from its meta.
 		if is_report:
-			columns = (report.name.as_("title"), report.ref_doctype, report.report_type)
+			columns = (report.name.as_("title"), report.ref_doctype, report.report_type, report.module)
 		else:
-			columns = (page.title.as_("title"),)
+			columns = (page.title.as_("title"), page.module)
 
 		customRole = DocType("Custom Role")
 		hasRole = DocType("Has Role")
 		parentTable = DocType(parent)
 
+		def exclude_disabled_reports(query):
+			return query.where(report.disabled == 0) if is_report else query
+
 		# get pages or reports set on custom role
-		pages_with_custom_roles = (
+		pages_with_custom_roles = exclude_disabled_reports(
 			frappe.qb.from_(customRole)
 			.from_(hasRole)
 			.from_(parentTable)
@@ -176,7 +211,12 @@ class DeskViews:
 		).run(as_dict=True)
 
 		for p in pages_with_custom_roles:
-			has_role[p.name] = {"modified": p.modified, "title": p.title, "ref_doctype": p.ref_doctype}
+			has_role[p.name] = {
+				"modified": p.modified,
+				"title": p.title,
+				"ref_doctype": p.ref_doctype,
+				"module": p.module,
+			}
 
 		subq = (
 			frappe.qb.from_(customRole)
@@ -184,7 +224,7 @@ class DeskViews:
 			.where(customRole[parent.lower()].isnotnull())
 		)
 
-		pages_with_standard_roles = (
+		pages_with_standard_roles = exclude_disabled_reports(
 			frappe.qb.from_(hasRole)
 			.from_(parentTable)
 			.select(parentTable.name.as_("name"), parentTable.modified, *columns)
@@ -194,16 +234,11 @@ class DeskViews:
 				& (parentTable.name.notin(subq))
 			)
 			.distinct()
-		)
-
-		if is_report:
-			pages_with_standard_roles = pages_with_standard_roles.where(report.disabled == 0)
-
-		pages_with_standard_roles = pages_with_standard_roles.run(as_dict=True)
+		).run(as_dict=True)
 
 		for p in pages_with_standard_roles:
 			if p.name not in has_role:
-				has_role[p.name] = {"modified": p.modified, "title": p.title}
+				has_role[p.name] = {"modified": p.modified, "title": p.title, "module": p.module}
 				if parent == "Report":
 					has_role[p.name].update({"ref_doctype": p.ref_doctype})
 
@@ -212,7 +247,7 @@ class DeskViews:
 		)
 
 		# pages and reports with no role are allowed
-		rows_with_no_roles = (
+		rows_with_no_roles = exclude_disabled_reports(
 			frappe.qb.from_(parentTable)
 			.select(parentTable.name, parentTable.modified, *columns)
 			.where(no_of_roles == 0)
@@ -220,7 +255,7 @@ class DeskViews:
 
 		for r in rows_with_no_roles:
 			if r.name not in has_role:
-				has_role[r.name] = {"modified": r.modified, "title": r.title}
+				has_role[r.name] = {"modified": r.modified, "title": r.title, "module": r.module}
 				if is_report:
 					has_role[r.name] |= {"ref_doctype": r.ref_doctype}
 
@@ -230,16 +265,35 @@ class DeskViews:
 
 			reports = frappe.get_list(
 				"Report",
-				fields=["name", "report_type"],
+				fields=["name", "report_type", "ref_doctype"],
 				filters={"name": ("in", has_role.keys())},
 				ignore_ifnull=True,
 				user=user,
 			)
+			permitted_names = set()
 			for report in reports:
-				has_role[report.name]["report_type"] = report.report_type
+				try:
+					if report.ref_doctype and not has_permission(
+						report.ref_doctype, "report", user=user, print_logs=False
+					):
+						continue
+					has_role[report.name]["report_type"] = report.report_type
+					permitted_names.add(report.name)
+				except frappe.DoesNotExistError:
+					frappe.log_error("Error occurred while checking report permissions")
 
-			non_permitted_reports = set(has_role.keys()) - {r.name for r in reports}
+			non_permitted_reports = set(has_role.keys()) - permitted_names
 			for r in non_permitted_reports:
 				has_role.pop(r, None)
+
+		if disabled_modules := get_disabled_modules():
+			hidden = (
+				frappe.qb.from_(parentTable)
+				.select(parentTable.name)
+				.where(parentTable.module.isin(list(disabled_modules)))
+				.run(pluck=True)
+			)
+			for name in hidden:
+				has_role.pop(name, None)
 
 		return has_role

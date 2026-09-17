@@ -28,6 +28,7 @@ from frappe.desk.form.load import getdoc
 from frappe.model.delete_doc import delete_controllers
 from frappe.model.sync import remove_orphan_doctypes
 from frappe.tests import IntegrationTestCase
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import get_table_name
 
 
@@ -51,7 +52,7 @@ class TestDocType(IntegrationTestCase):
 			doc.delete()
 
 	@skipIf(
-		frappe.conf.db_type == "sqlite",
+		frappe.conf and frappe.conf.db_type == "sqlite",
 		"Not for SQLite for now",
 	)
 	def test_making_sequence_on_change(self):
@@ -775,6 +776,20 @@ class TestDocType(IntegrationTestCase):
 
 		self.assertRaises(frappe.ValidationError, doctype.insert)
 
+	def test_attachment_gallery_filters_must_target_file(self):
+		doctype = new_doctype(
+			fields=[
+				{
+					"label": "Attachments",
+					"fieldname": "attachments",
+					"fieldtype": "Attachment Gallery",
+					"link_filters": '[["User", "name", "=", "Administrator"]]',
+				}
+			]
+		)
+
+		self.assertRaises(frappe.ValidationError, doctype.insert)
+
 	def test_missing_link_filters_field_is_allowed(self):
 		doctype = new_doctype()
 		doctype.fields[0].__dict__.pop("link_filters", None)
@@ -983,6 +998,7 @@ class TestDocType(IntegrationTestCase):
 		os.access(frappe.get_app_path("frappe"), os.W_OK), "Only run if frappe app paths is writable"
 	)
 	@patch.dict(frappe.conf, {"developer_mode": 1})
+	@requires_test_service(TestService.BACKGROUND_WORKER)
 	def test_delete_orphaned_doctypes(self):
 		doctype = new_doctype(custom=0).insert()
 		frappe.db.commit()

@@ -4,7 +4,8 @@
 // link validation
 // custom queries
 // add_fetches
-import Awesomplete from "awesomplete";
+import Awesomplete from "../../ui/awesomplete";
+
 frappe.ui.form.recent_link_validations = {};
 
 frappe.ui.form.ControlLink = class ControlLink extends frappe.ui.form.ControlData {
@@ -82,7 +83,7 @@ frappe.ui.form.ControlLink = class ControlLink extends frappe.ui.form.ControlDat
 	}
 
 	is_clear_button_enabled() {
-		return Boolean(cint(frappe.boot?.sysdefaults?.allow_clearing_link_fields));
+		return frappe.defaults.is_enabled("allow_clearing_link_fields");
 	}
 
 	hide_link_and_clear_buttons() {
@@ -288,10 +289,8 @@ frappe.ui.form.ControlLink = class ControlLink extends frappe.ui.form.ControlDat
 			}
 			let value = me.get_input_value();
 			let label = me.get_label_value();
-			let last_value = me.last_value || "";
-			let last_label = me.label || "";
 
-			if (value !== last_value) {
+			if (value !== (me.value || "")) {
 				me.parse_validate_and_set_in_model(value, null, label);
 			}
 		});
@@ -846,7 +845,23 @@ frappe.ui.form.ControlLink = class ControlLink extends frappe.ui.form.ControlDat
 		}
 
 		if (this.df.link_filters && !!this.df.link_filters.length) {
-			args.filters = { ...(args.filters || {}), ...this.apply_link_field_filters() };
+			const link_filters = this.apply_link_field_filters();
+
+			if (Array.isArray(args.filters)) {
+				const doctype = this.get_options();
+				const fieldnames = Object.keys(link_filters);
+				args.filters = args.filters
+					.filter((filter) => {
+						const [filter_doctype, fieldname] =
+							filter.length >= 4 ? filter : [doctype, filter[0]];
+						return filter_doctype !== doctype || !fieldnames.includes(fieldname);
+					})
+					.concat(
+						fieldnames.map((fieldname) => [fieldname, ...link_filters[fieldname]])
+					);
+			} else {
+				args.filters = { ...(args.filters || {}), ...link_filters };
+			}
 		}
 	}
 

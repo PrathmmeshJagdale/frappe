@@ -2,6 +2,9 @@ import unittest
 from collections.abc import Callable
 from datetime import time
 
+from pypika.functions import Cast
+from pypika.terms import ValueWrapper
+
 import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.database.operator_map import func_in
@@ -49,6 +52,33 @@ class TestCustomFunctionsMariaDB(IntegrationTestCase):
 		sql = query.get_sql()
 		self.assertIn("SEPARATOR ' | '", sql)
 		self.assertIn("`user_list`", sql)
+
+	def test_concat_alias_escapes_the_quote_char(self):
+		# The alias goes through format_alias_sql like every other term, so the quote char inside
+		# it is doubled. Rendering it raw would close the identifier early, and would disagree
+		# with the escaped alias pypika emits for the same term in GROUP BY / ORDER BY.
+		user = frappe.qb.DocType("User")
+		gc = GroupConcat(user.email).as_("a`b")
+		sql = frappe.qb.from_(user).select(gc).groupby(gc).get_sql()
+		self.assertIn("`a``b`", sql)
+		self.assertNotIn("`a`b`", sql)
+		# the alias SELECT declares is the one GROUP BY refers to
+		self.assertEqual(2, sql.count("`a``b`"))
+
+	def test_concat_alias_only_in_select_position(self):
+		# an alias is part of the select clause, not of the expression: appending it in operand
+		# position produces `GROUP_CONCAT(...) `x` LIKE ...`, which is a syntax error
+		user = frappe.qb.DocType("User")
+		gc = GroupConcat(user.email).as_("user_list")
+		sql = frappe.qb.from_(user).select(user.name).where(gc.like("%admin%")).get_sql()
+		self.assertNotIn("`user_list`", sql)
+		self.assertIn("GROUP_CONCAT(`email` SEPARATOR ',') LIKE", sql)
+
+	def test_concat_with_explicit_empty_separator(self):
+		# "" means "no delimiter", not "use the default" -- dropping the clause would silently
+		# fall back to MariaDB's comma while postgres STRING_AGG concatenates bare.
+		self.assertEqual("GROUP_CONCAT('Notes' SEPARATOR '')", GroupConcat("Notes", "").get_sql())
+		self.assertEqual("GROUP_CONCAT('Notes' SEPARATOR '')", GroupConcat("Notes").separator("").get_sql())
 
 	def test_like_keeps_native_operator(self):
 		# MariaDB LIKE is already case-insensitive; keep the native operator
@@ -271,6 +301,11 @@ class TestCustomFunctionsPostgres(IntegrationTestCase):
 		# .separator() chaining must work on postgres too (STRING_AGG has no native SEPARATOR keyword)
 		self.assertEqual("STRING_AGG('Notes',' | ')", GroupConcat("Notes").separator(" | ").get_sql())
 
+	def test_concat_with_explicit_empty_separator(self):
+		# must mean the same thing as the MariaDB rendering: no delimiter at all
+		self.assertEqual("STRING_AGG('Notes','')", GroupConcat("Notes", "").get_sql())
+		self.assertEqual("STRING_AGG('Notes','')", GroupConcat("Notes").separator("").get_sql())
+
 	def test_like_is_case_insensitive(self):
 		# postgres LIKE is case-sensitive; render ILIKE so search matches MariaDB's case-insensitivity
 		user = frappe.qb.DocType("User")
@@ -364,8 +399,8 @@ class TestCustomFunctionsPostgres(IntegrationTestCase):
 		# Simple Query
 		note = frappe.qb.DocType("Note")
 		self.assertEqual(
-			"cast(extract(epoch from (cast(posting_date as timestamp) "
-			"at time zone current_setting('timezone'))) as bigint)",
+			"cast(trunc(extract(epoch from (cast(posting_date as timestamp) "
+			"at time zone current_setting('timezone')))) as bigint)",
 			UnixTimestamp(note.posting_date).get_sql().lower(),
 		)
 
@@ -378,10 +413,53 @@ class TestCustomFunctionsPostgres(IntegrationTestCase):
 			.select(UnixTimestamp(note.posting_date))
 		)
 		self.assertIn(
-			'cast(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
-			"at time zone current_setting('timezone'))) as bigint)",
+			'cast(trunc(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
+			"at time zone current_setting('timezone')))) as bigint)",
 			str(select_query).lower(),
 		)
+
+		# Order by
+		select_query = select_query.orderby(UnixTimestamp(note.posting_date))
+		self.assertIn(
+			'order by cast(trunc(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
+			"at time zone current_setting('timezone')))) as bigint)",
+			str(select_query).lower(),
+		)
+
+		# Function comparison
+		select_query = select_query.where(
+			UnixTimestamp(note.posting_date) >= UnixTimestamp(Date("2021-01-01"))
+		)
+		self.assertIn(
+			'cast(trunc(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
+			"at time zone current_setting('timezone')))) as bigint)"
+			">=cast(trunc(extract(epoch from (cast(date('2021-01-01') as timestamp) "
+			"at time zone current_setting('timezone')))) as bigint)",
+			str(select_query).lower(),
+		)
+
+		# aliasing
+		select_query = select_query.select(UnixTimestamp(note.posting_date, alias="unix_ts"))
+		self.assertIn(
+			'cast(trunc(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
+			"at time zone current_setting('timezone')))) as bigint) \"unix_ts\"",
+			str(select_query).lower(),
+		)
+
+	def test_unix_ts_postgres_truncates_fractional_seconds(self):
+		# MariaDB's UNIX_TIMESTAMP carries the fraction; casting it to an int truncates. A bare
+		# CAST(... AS BIGINT) rounds instead, pushing a .5+ timestamp a second into the future.
+		dt = frappe.qb.DocType("DocType")
+		for fraction, expected in ((".4", 0), (".5", 0), (".6", 0)):
+			stamp = UnixTimestamp(Cast(f"2021-06-01 00:00:00{fraction}", "timestamp"))
+			got = frappe.qb.from_(dt).select(stamp).limit(1).run()[0][0]
+			baseline = (
+				frappe.qb.from_(dt)
+				.select(UnixTimestamp(Cast("2021-06-01 00:00:00", "timestamp")))
+				.limit(1)
+				.run()[0][0]
+			)
+			self.assertEqual(got - baseline, expected, msg=f"fraction {fraction}")
 
 	def test_unix_ts_postgres_uses_session_timezone(self):
 		from datetime import datetime
@@ -402,11 +480,11 @@ class TestCustomFunctionsPostgres(IntegrationTestCase):
 		# Postgres subtracts dates to get an integer day count, matching MariaDB DATEDIFF.
 		note = frappe.qb.DocType("Note")
 		self.assertEqual(
-			"posting_date-creation",
+			"CAST(posting_date AS DATE)-CAST(creation AS DATE)",
 			DateDiff(note.posting_date, note.creation).get_sql(),
 		)
 		self.assertEqual(
-			"CAST('2024-01-10' AS DATE)-creation",
+			"CAST('2024-01-10' AS DATE)-CAST(creation AS DATE)",
 			DateDiff("2024-01-10", note.creation).get_sql(),
 		)
 
@@ -417,35 +495,19 @@ class TestCustomFunctionsPostgres(IntegrationTestCase):
 			.on(todo.refernce_name == note.name)
 			.select(DateDiff(note.posting_date, note.creation))
 		)
-		self.assertIn('select "tabnote"."posting_date"-"tabnote"."creation"', str(select_query).lower())
-
-		# Order by
-		select_query = select_query.orderby(UnixTimestamp(note.posting_date))
 		self.assertIn(
-			'order by cast(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
-			"at time zone current_setting('timezone'))) as bigint)",
+			'select cast("tabnote"."posting_date" as date)-cast("tabnote"."creation" as date)',
 			str(select_query).lower(),
 		)
 
-		# Function comparison
-		select_query = select_query.where(
-			UnixTimestamp(note.posting_date) >= UnixTimestamp(Date("2021-01-01"))
-		)
-		self.assertIn(
-			'cast(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
-			"at time zone current_setting('timezone'))) as bigint)"
-			">=cast(extract(epoch from (cast(date('2021-01-01') as timestamp) "
-			"at time zone current_setting('timezone'))) as bigint)",
-			str(select_query).lower(),
-		)
-
-		# aliasing
-		select_query = select_query.select(UnixTimestamp(note.posting_date, alias="unix_ts"))
-		self.assertIn(
-			'cast(extract(epoch from (cast("tabnote"."posting_date" as timestamp) '
-			"at time zone current_setting('timezone'))) as bigint) \"unix_ts\"",
-			str(select_query).lower(),
-		)
+	def test_datediff_postgres_returns_whole_days_for_timestamps(self):
+		# Subtracting two timestamps yields an interval that keeps the time of day, so a Datetime
+		# operand would come back as a timedelta where MariaDB's DATEDIFF returns whole days.
+		dt = frappe.qb.DocType("DocType")
+		diff = DateDiff(Cast("2024-01-10 01:00:00", "timestamp"), Cast("2024-01-01 23:00:00", "timestamp"))
+		got = frappe.qb.from_(dt).select(diff).limit(1).run()[0][0]
+		self.assertEqual(got, 9)
+		self.assertIsInstance(got, int)
 
 	def test_time(self):
 		note = frappe.qb.DocType("Note")
@@ -590,6 +652,29 @@ class TestParameterization(IntegrationTestCase):
 		self.assertIn("%(param1)s", query)
 		self.assertIn("param1", params)
 		self.assertEqual(params["param1"], "some_value")
+
+	def test_bool_conditions(self):
+		# bools go out as '1'/'0': quoted, so they work as a value and as a condition
+		DocType = frappe.qb.DocType("DocType")
+		query, params = frappe.qb.update(DocType).set(DocType.is_submittable, True).walk()
+
+		self.assertIn("='1'", query)
+		self.assertNotIn("true", query)
+		self.assertEqual(params, {})
+
+		query, _ = frappe.qb.update(DocType).set(DocType.is_submittable, False).walk()
+		self.assertIn("='0'", query)
+
+		# a bool as a condition, not as a value: it must stay a quoted literal, since
+		# postgres accepts neither a bare 1 nor `true` as an operand of OR
+		user = frappe.qb.DocType("User")
+		condition = frappe.qb.from_(user).select(user.name).where((user.enabled == 1) | ValueWrapper(False))
+
+		query, _ = condition.walk()
+		self.assertIn("OR '0'", query)
+		self.assertNotIn("OR 0", query)
+		self.assertNotIn("OR false", query)
+		condition.run()  # and the database accepts it
 
 	def test_where_conditions_functions(self):
 		DocType = frappe.qb.DocType("DocType")

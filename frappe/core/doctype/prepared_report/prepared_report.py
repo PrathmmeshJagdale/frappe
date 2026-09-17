@@ -14,7 +14,7 @@ import frappe
 from frappe import _
 from frappe.database.utils import dangerously_reconnect_on_connection_abort
 from frappe.desk.form.load import get_attachments
-from frappe.desk.query_report import generate_report_result
+from frappe.desk.query_report import generate_report_result, get_reference_report
 from frappe.model.document import Document
 from frappe.monitor import add_data_to_monitor
 from frappe.utils import add_to_date, now
@@ -131,8 +131,10 @@ def generate_report(prepared_report):
 
 		if report.report_type == "Custom Report":
 			custom_report_doc = report
-			reference_report = custom_report_doc.reference_report
-			report = frappe.get_doc("Report", reference_report)
+			report = get_reference_report(custom_report_doc)
+			report.custom_report = instance.report_name
+			report.prepared_report = custom_report_doc.prepared_report
+			report.disable_prepared_report_automation = custom_report_doc.disable_prepared_report_automation
 			if custom_report_doc.json:
 				data = json.loads(custom_report_doc.json)
 				if data:
@@ -143,7 +145,7 @@ def generate_report(prepared_report):
 		create_json_gz_file(result, instance.doctype, instance.name, instance.report_name)
 
 		if report.generate_csv:
-			enqueue_json_to_csv_conversion(prepared_report)
+			_enqueue_json_to_csv_conversion(prepared_report)
 
 		instance.status = "Completed"
 
@@ -203,6 +205,9 @@ def update_job_id(prepared_report):
 @frappe.whitelist()
 def make_prepared_report(report_name: str, filters: dict[str, Any] | str | list | None = None):
 	"""run reports in background"""
+	from frappe.desk.query_report import get_report_doc
+
+	get_report_doc(report_name)
 	prepared_report = frappe.get_doc(
 		{
 			"doctype": "Prepared Report",
@@ -339,14 +344,17 @@ def get_permission_query_condition(user):
 
 	from frappe.utils.user import UserPermissions
 
-	user = UserPermissions(user)
+	user_perms = UserPermissions(user)
 
-	if "System Manager" in user.roles:
+	if "System Manager" in user_perms.roles:
 		return None
 
-	reports = [frappe.db.escape(report) for report in user.get_all_reports().keys()]
+	reports = [frappe.db.escape(report) for report in user_perms.get_all_reports().keys()]
 
-	return """`tabPrepared Report`.report_name in ({reports})""".format(reports=",".join(reports))
+	reports = ",".join(reports)
+	owner = frappe.db.escape(user)
+
+	return f"""`tabPrepared Report`.report_name in ({reports}) and `tabPrepared Report`.owner = {owner}"""
 
 
 def has_permission(doc, user):
@@ -368,6 +376,11 @@ def has_permission(doc, user):
 @frappe.whitelist()
 def enqueue_json_to_csv_conversion(prepared_report_name: str):
 	"""Call this to enqueue the conversion in background."""
+	frappe.get_doc("Prepared Report", prepared_report_name).check_permission("read")
+	_enqueue_json_to_csv_conversion(prepared_report_name)
+
+
+def _enqueue_json_to_csv_conversion(prepared_report_name: str):
 	enqueue(method=convert_json_to_csv, queue="long", prepared_report_name=prepared_report_name)
 
 

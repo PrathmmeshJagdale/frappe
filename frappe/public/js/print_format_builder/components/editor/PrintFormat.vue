@@ -1,34 +1,36 @@
 <template>
 	<div
-		class="print-format-main"
+		class="print-format-main print-format"
+		data-theme="light"
 		:style="rootStyles"
 		:class="{
 			'pfb-clean-preview': !!store.preview_doc.value,
 			'print-format-doc': !!store.preview_doc.value,
+			'show-label-colon': !!print_format.show_label_colon,
 		}"
 	>
 		<component :is="'style'" v-if="color_css">{{ color_css }}</component>
+		<component :is="'style'" v-if="user_css">{{ user_css }}</component>
 		<div v-if="!page_number_hidden" class="pfb-page-num" :style="page_number_style">
 			{{ __("1 of 2") }}
 		</div>
 
-		<LetterHeadZoneEditor zone="header" />
+		<!-- One header area: the letterhead and the header fields zone read as a single
+		     region. The fields wrapper carries the body font (letterhead stays unstyled),
+		     and the empty header drop-zone only surfaces while a drag is in progress. -->
+		<div class="pfb-header-area" :class="{ 'pfb-header-area--selected': header_selected }">
+			<LetterHeadZoneEditor zone="header" />
+			<div
+				class="pfb-header-fields"
+				:class="{ 'pfb-header-fields--empty': header_is_empty }"
+				:style="bodyStyles"
+			>
+				<PrintFormatSection :section="layout.header" :is_header="true" zone="header" />
+			</div>
+		</div>
 
 		<!-- Body wrapper: font size/family applied here so letterhead zones are unaffected -->
 		<div class="pfb-body" :style="bodyStyles">
-			<div class="zone-divider">
-				<span class="zone-divider-label">
-					{{ __("Header") }}
-					<span v-if="repeat_header_footer" class="zone-divider-hint"
-						>· {{ __("repeats on all pages") }}</span
-					>
-				</span>
-			</div>
-			<PrintFormatSection :section="layout.header" :is_header="true" zone="header" />
-			<div class="zone-divider">
-				<span class="zone-divider-label">{{ __("Body") }}</span>
-			</div>
-
 			<draggable
 				class="sections-container"
 				v-model="layout.sections"
@@ -37,6 +39,9 @@
 				item-key="id"
 				handle=".section-drag-handle"
 				filter=".section-columns, .column, .field"
+				v-bind="DRAG_OPTIONS"
+				@start="setDragging(true)"
+				@end="setDragging(false)"
 				@add="on_section_add"
 			>
 				<template #item="{ element, index }">
@@ -46,18 +51,25 @@
 					</div>
 				</template>
 				<template #footer>
-					<SectionInsert @insert="add_section_at(layout.sections.length)" />
+					<SectionInsert
+						v-if="layout.sections && layout.sections.length"
+						@insert="add_section_at(layout.sections.length)"
+					/>
 				</template>
 			</draggable>
 
-			<div class="zone-divider">
-				<span class="zone-divider-label">
-					{{ __("Footer") }}
-					<span v-if="repeat_header_footer" class="zone-divider-hint"
-						>· {{ __("repeats on all pages") }}</span
-					>
+			<button
+				v-if="!layout.sections || !layout.sections.length"
+				class="body-empty"
+				@click="add_section_at(0)"
+			>
+				<span class="body-empty-icon" v-html="frappe.utils.icon('plus', 'md')"></span>
+				<span class="body-empty-title">{{ __("Add a section") }}</span>
+				<span class="body-empty-hint">
+					{{ __("Sections hold the columns and fields of your document.") }}
 				</span>
-			</div>
+			</button>
+
 			<PrintFormatSection :section="layout.footer" :is_header="true" zone="footer" />
 		</div>
 
@@ -70,11 +82,21 @@ import draggable from "vuedraggable";
 import LetterHeadZoneEditor from "../letterhead/LetterHeadZoneEditor.vue";
 import PrintFormatSection from "./PrintFormatSection.vue";
 import SectionInsert from "./SectionInsert.vue";
+import { DRAG_OPTIONS, setDragging, field_uid } from "../../utils";
 import { useStore } from "../../stores";
 import { computed, inject, watch, nextTick, onMounted, onUnmounted, ref } from "vue";
 
 let { layout, letterhead, print_format } = useStore();
+
+// one definition of "the header holds no fields" — the tree and the canvas
+// both key off it, so a deleted field (kept in the DOM as a tombstone) can't
+// make them disagree
+let header_is_empty = computed(
+	() =>
+		!(layout.value.header?.columns || []).some((c) => (c.fields || []).some((f) => !f.remove))
+);
 let store = inject("$store");
+let header_selected = computed(() => store.selected_sections.value.includes(layout.value.header));
 
 const PAGE_SIZES_MM = { A4: [210, 297], Letter: [216, 279.4] };
 let page_size = ref("A4");
@@ -107,16 +129,24 @@ watch(
 onUnmounted(() => document.getElementById(CUSTOM_CSS_ID)?.remove());
 
 watch(
-	() => store.scroll_to_section.value,
-	(section) => {
-		if (!section) return;
+	() => store.scroll_target.value,
+	(target) => {
+		if (!target) return;
 		nextTick(() => {
-			const els = document.querySelectorAll("[data-pfb-section]");
-			const idx = layout.value.sections.indexOf(section);
-			if (idx >= 0 && els[idx]) {
-				els[idx].scrollIntoView({ behavior: "smooth", block: "start" });
+			// a field carries a fieldtype; a section carries columns — a field
+			// scrolls to its own node so the exact row lands on screen, not just
+			// the section it lives in
+			if (target.columns) {
+				const els = document.querySelectorAll("[data-pfb-section]");
+				const idx = layout.value.sections.indexOf(target);
+				if (idx >= 0 && els[idx]) {
+					els[idx].scrollIntoView({ behavior: "smooth", block: "start" });
+				}
+			} else {
+				const el = document.querySelector(`[data-field-uid="${field_uid(target)}"]`);
+				el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 			}
-			store.scroll_to_section.value = null;
+			store.scroll_target.value = null;
 		});
 	}
 );
@@ -165,10 +195,47 @@ let rootStyles = computed(() => {
 let bodyStyles = computed(() => {
 	const { font_size, font } = print_format.value;
 	const styles = {};
-	if (font_size) styles.fontSize = `${parseFloat(font_size)}px`;
+	styles.fontSize = `${parseFloat(font_size) || 14}px`;
 	if (font) styles.fontFamily = `'${font}', sans-serif`;
 	return styles;
 });
+
+// The format's custom CSS applies to the whole document in the printed PDF;
+// on the canvas that document is this component, so every selector is scoped
+// to it before the style hits the desk DOM
+let user_css = computed(() => scope_css(print_format.value.css, ".print-format-main"));
+
+function scope_css(css, scope) {
+	if (!(css || "").trim()) return "";
+	const style = document.createElement("style");
+	style.media = "not all";
+	style.textContent = css;
+	document.head.appendChild(style);
+	const prefix_rule = (rule) => {
+		if (rule.type === CSSRule.MEDIA_RULE || rule.type === CSSRule.SUPPORTS_RULE) {
+			const inner = [...rule.cssRules].map(prefix_rule).join("\n");
+			const head = rule.cssText.slice(0, rule.cssText.indexOf("{"));
+			return `${head}{\n${inner}\n}`;
+		}
+		if (rule.selectorText) {
+			const scoped = rule.selectorText
+				.split(",")
+				.map((sel) => {
+					sel = sel.trim();
+					const rootless = sel.replace(/^(html|body)(?![\w-])\s*/i, "");
+					return rootless ? `${scope} ${rootless}` : scope;
+				})
+				.join(", ");
+			return rule.cssText.replace(rule.selectorText, scoped);
+		}
+		return rule.cssText;
+	};
+	try {
+		return [...(style.sheet?.cssRules || [])].map(prefix_rule).join("\n");
+	} finally {
+		style.remove();
+	}
+}
 
 // Same scoped colour rules the server appends after the shared stylesheet;
 // rendered as a style element inside the component so it dies with the DOM
@@ -187,10 +254,6 @@ let color_css = computed(() => {
 	}
 	return css;
 });
-
-let repeat_header_footer = computed(
-	() => !!frappe.model.get_doc(":Print Settings", "Print Settings")?.repeat_header_footer
-);
 
 let page_number_hidden = computed(() => print_format.value.page_number.includes("Hide"));
 
@@ -214,9 +277,6 @@ let page_number_style = computed(() => {
 	}
 	return style;
 });
-
-watch(layout, () => (store.dirty.value = true), { deep: true });
-watch(print_format, () => (store.dirty.value = true), { deep: true });
 </script>
 
 <style scoped>
@@ -243,35 +303,47 @@ watch(print_format, () => (store.dirty.value = true), { deep: true });
 	margin-bottom: 1rem;
 }
 
-/* ── Zone dividers ────────────────────────────────────────── */
-.zone-divider {
+/* ── Empty-body call to action ────────────────────────────── */
+.body-empty {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 4px;
+	width: 100%;
+	padding: 2rem 1rem;
+	border: 1px dashed var(--gray-300);
+	border-radius: var(--radius);
+	background: var(--gray-50);
+	color: var(--text-muted);
+	cursor: pointer;
+	transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.body-empty:hover {
+	border-color: var(--gray-500);
+	background: var(--gray-100);
+	color: var(--text-color);
+}
+
+.body-empty-icon {
 	display: flex;
 	align-items: center;
-	gap: 12px;
-	margin: 0.75rem 0 0.5rem;
-}
-
-.zone-divider::before,
-.zone-divider::after {
-	content: "";
-	flex: 1;
-	height: 1px;
+	justify-content: center;
+	width: 28px;
+	height: 28px;
+	margin-bottom: 2px;
+	border-radius: 50%;
 	background: var(--gray-200);
+	color: var(--gray-700);
 }
 
-.zone-divider-label {
-	font-size: var(--text-tiny);
+.body-empty-title {
+	font-size: var(--text-md);
 	font-weight: var(--weight-medium);
-	text-transform: uppercase;
-	letter-spacing: 0.12em;
-	white-space: nowrap;
-	color: var(--gray-400);
 }
 
-.zone-divider-hint {
-	text-transform: none;
-	font-weight: var(--weight-regular);
-	letter-spacing: 0.02em;
+.body-empty-hint {
+	font-size: var(--text-sm);
 }
 
 .section-with-insert {
@@ -299,18 +371,7 @@ watch(print_format, () => (store.dirty.value = true), { deep: true });
 	transition: border-color 0.1s;
 }
 
-/* Outlines live on the container so they enclose the section's margin too */
-.pfb-clean-preview :deep(.print-format-section-container:hover) {
-	outline: 1px dashed var(--gray-400);
-	outline-offset: 2px;
-	border-radius: var(--radius);
-}
-
-.pfb-clean-preview :deep(.print-format-section-container:has(.section--selected)) {
-	outline: 1px solid var(--gray-400);
-	outline-offset: 2px;
-	border-radius: var(--radius);
-}
+/* section hover/selection rings live in one place — PrintFormatSection.vue */
 
 .pfb-clean-preview :deep(.print-format-section-container) {
 	margin-bottom: 0;
@@ -339,9 +400,8 @@ watch(print_format, () => (store.dirty.value = true), { deep: true });
 }
 
 .pfb-clean-preview :deep(.print-format-section-container:hover .section-preview-actions),
-.pfb-clean-preview :deep(.print-format-section.section--selected ~ .section-preview-actions),
 .pfb-clean-preview
-	:deep(.print-format-section-container:has(.section--selected) .section-preview-actions) {
+	:deep(.print-format-section-container.pfb-section-active .section-preview-actions) {
 	opacity: 1;
 }
 

@@ -28,7 +28,7 @@ jobs:
           mkdir -p sites
           echo "frappe" > sites/apps.txt
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: yarn
@@ -48,7 +48,7 @@ jobs:
 
       - name: Package assets
         working-directory: apps/frappe
-        run: tar czf frappe-assets.tar.gz -C ../../sites/assets/frappe dist
+        run: tar -czhf frappe-assets.tar.gz -C ../../sites/assets/frappe dist
 
       - name: Upload to rolling release
         working-directory: apps/frappe

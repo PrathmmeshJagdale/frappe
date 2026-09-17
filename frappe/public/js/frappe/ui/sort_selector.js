@@ -15,7 +15,9 @@ frappe.ui.SortSelector = class SortSelector {
 	make() {
 		this.prepare_args();
 		this.parent.find(".sort-selector").remove();
-		this.wrapper = $(frappe.render_template("sort_selector", this.args)).appendTo(this.parent);
+		this.wrapper = $(
+			frappe.render_template("sort_selector", { ...this.args, doctype: this.doctype })
+		).appendTo(this.parent);
 		this.bind_events();
 	}
 	bind_events() {
@@ -41,16 +43,24 @@ frappe.ui.SortSelector = class SortSelector {
 
 		if (this.sort_by !== sort_by) {
 			this.sort_by = sort_by;
-			$text.html(__(this.get_label(sort_by)));
+			$text.html(__(this.get_label(sort_by), null, this.doctype));
 		}
 		if (this.sort_order !== sort_order) {
 			this.sort_order = sort_order;
-			const title = sort_order === "desc" ? __("ascending") : __("descending");
-			const icon_name =
-				sort_order === "asc" ? "arrow-up-narrow-wide" : "arrow-down-wide-narrow";
+			const SORT_TITLE_AND_ICON = {
+				desc: {
+					title: __("descending"),
+					icon: "arrow-down-wide-narrow",
+				},
+				asc: {
+					title: __("ascending"),
+					icon: "arrow-up-narrow-wide",
+				},
+			};
+			const { title, icon } = SORT_TITLE_AND_ICON[sort_order];
 			$btn.attr("data-value", sort_order);
 			$btn.attr("title", title);
-			$icon.html(frappe.utils.icon(icon_name, "sm"));
+			$icon.html(frappe.utils.icon(icon, "sm"));
 		}
 	}
 	prepare_args() {
